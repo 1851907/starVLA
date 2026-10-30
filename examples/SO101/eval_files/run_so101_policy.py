@@ -76,6 +76,11 @@ def main() -> None:
     parser.add_argument("--max-control-steps", type=int, default=100)
     parser.add_argument("--enable-motion", action="store_true")
     parser.add_argument(
+        "--direct-action", action="store_true",
+        help="Send the first model target directly, bypassing script position, "
+             "step-distance and slew limits. Requires --enable-motion to send.",
+    )
+    parser.add_argument(
         "--max-joint-speed", type=lambda value: parse_vector(value, "max-joint-speed"),
         help="Enable repeated execution: six command slew limits in joint units/second.",
     )
@@ -85,23 +90,31 @@ def main() -> None:
     parser.add_argument(
         "--joint-lower",
         type=lambda value: parse_vector(value, "joint-lower"),
-        required=True,
     )
     parser.add_argument(
         "--joint-upper",
         type=lambda value: parse_vector(value, "joint-upper"),
-        required=True,
     )
     parser.add_argument(
         "--max-step-delta",
         type=lambda value: parse_vector(value, "max-step-delta"),
-        required=True,
     )
     args = parser.parse_args()
 
-    lower, upper, max_delta = validate_limits(
-        args.joint_lower, args.joint_upper, args.max_step_delta
-    )
+    if args.direct_action:
+        if any(value is not None for value in (
+            args.joint_lower, args.joint_upper, args.max_step_delta, args.max_joint_speed
+        )):
+            parser.error("--direct-action cannot be combined with joint limits or speed limits")
+        lower = upper = max_delta = None
+    else:
+        if any(value is None for value in (
+            args.joint_lower, args.joint_upper, args.max_step_delta
+        )):
+            parser.error("Provide joint-lower, joint-upper and max-step-delta, or --direct-action")
+        lower, upper, max_delta = validate_limits(
+            args.joint_lower, args.joint_upper, args.max_step_delta
+        )
     for name in ("servo_hz", "action_duration_s", "control_period_s"):
         if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             parser.error(f"{name} must be finite and positive")
@@ -120,6 +133,8 @@ def main() -> None:
         args.robot_port, args.robot_id, use_degrees=args.joint_units == "degrees"
     )
     print("Policy server metadata:", client.get_server_metadata())
+    if args.direct_action:
+        print("DIRECT ACTION: script position, step-distance and slew limits are disabled.")
     print(
         "MOTION ENABLED: executing the first predicted target with configured limits."
         if args.enable_motion
@@ -151,9 +166,13 @@ def main() -> None:
 
             current = robot.read_state()
             raw_target = actions[0, 0]
-            if np.any(current < lower) or np.any(current > upper):
+            if not np.all(np.isfinite(raw_target)):
+                raise UnsafeActionError("Model target contains non-finite values")
+            if not np.all(np.isfinite(current)):
+                raise UnsafeActionError("Joint state contains non-finite values")
+            if not args.direct_action and (np.any(current < lower) or np.any(current > upper)):
                 raise UnsafeActionError(f"Joint state outside configured bounds: {current}")
-            safe_target = make_safe_target(
+            safe_target = raw_target.copy() if args.direct_action else make_safe_target(
                 raw_target, current, lower, upper, max_delta
             )
             if args.max_joint_speed is not None:
