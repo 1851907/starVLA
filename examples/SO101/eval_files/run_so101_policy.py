@@ -44,6 +44,11 @@ def main() -> None:
     parser.add_argument("--unnorm-key", default="new_embodiment")
     parser.add_argument("--robot-port", required=True)
     parser.add_argument("--robot-id", default="so101_follower")
+    parser.add_argument(
+        "--joint-units", choices=("degrees", "normalized"), required=True,
+        help="Match collection: degrees or normalized (-100..100) body joints; "
+             "gripper is always 0..100.",
+    )
     parser.add_argument("--control-period-s", type=float, default=0.25)
     parser.add_argument("--max-control-steps", type=int, default=100)
     parser.add_argument("--enable-motion", action="store_true")
@@ -73,12 +78,15 @@ def main() -> None:
         raise RuntimeError("Unable to open both front and side cameras")
 
     client = WebsocketClientPolicy(args.server_host, args.server_port)
-    robot = SO101RobotAdapter(args.robot_port, args.robot_id)
+    robot = SO101RobotAdapter(
+        args.robot_port, args.robot_id, use_degrees=args.joint_units == "degrees"
+    )
     print("Policy server metadata:", client.get_server_metadata())
     print(
         "MOTION ENABLED: only one filtered action is sent per policy request."
         if args.enable_motion
-        else "DRY RUN: no command will be sent. Pass --enable-motion only after calibration."
+        else "DRY RUN: no policy target will be sent. Driver connection still "
+             "configures motors and may calibrate or enable torque."
     )
 
     try:
@@ -99,7 +107,8 @@ def main() -> None:
                 }
             )
             actions = np.asarray(response["data"]["actions"], dtype=np.float32)
-            if actions.shape[0] != 1 or actions.shape[2] != len(ACTION_NAMES):
+            if (actions.ndim != 3 or actions.shape[0] != 1
+                    or actions.shape[1] == 0 or actions.shape[2] != len(ACTION_NAMES)):
                 raise UnsafeActionError(f"Unexpected action shape: {actions.shape}")
 
             current = robot.read_state()
@@ -112,7 +121,8 @@ def main() -> None:
                 f"raw={raw_target} safe={safe_target}"
             )
             if args.enable_motion:
-                robot.send_joint_target(safe_target)
+                sent_target = robot.send_joint_target(safe_target)
+                print(f"step={control_step} sent={sent_target}")
 
             elapsed = time.monotonic() - started_at
             time.sleep(max(0.0, args.control_period_s - elapsed))
