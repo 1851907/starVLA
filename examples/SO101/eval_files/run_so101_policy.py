@@ -34,6 +34,29 @@ def read_rgb(camera: cv2.VideoCapture, name: str) -> np.ndarray:
     return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
 
+def execute_target(robot, target, lower, upper, max_delta, speed, hz, duration):
+    """Slew commanded positions; this is not a motor velocity controller."""
+    period = 1.0 / hz
+    previous = robot.read_state()
+    deadline = time.monotonic() + duration
+    sent = previous.copy()
+    while time.monotonic() < deadline:
+        tick = time.monotonic()
+        current = robot.read_state()
+        if not np.all(np.isfinite(current)) or np.any(current < lower) or np.any(current > upper):
+            raise UnsafeActionError(f"Joint state outside configured bounds: {current}")
+        # Bound both command slew and distance from measured position. Never
+        # compensate for a delayed tick with a larger jump.
+        lo = np.maximum(np.maximum(lower, previous - speed * period), current - max_delta)
+        hi = np.minimum(np.minimum(upper, previous + speed * period), current + max_delta)
+        if np.any(lo > hi):
+            raise UnsafeActionError("Tracking error exceeds configured command limits")
+        sent = robot.send_joint_target(np.clip(target, lo, hi))
+        previous = sent.copy()
+        time.sleep(max(0.0, period - (time.monotonic() - tick)))
+    return sent, robot.read_state()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-host", required=True)
@@ -52,6 +75,13 @@ def main() -> None:
     parser.add_argument("--control-period-s", type=float, default=0.25)
     parser.add_argument("--max-control-steps", type=int, default=100)
     parser.add_argument("--enable-motion", action="store_true")
+    parser.add_argument(
+        "--max-joint-speed", type=lambda value: parse_vector(value, "max-joint-speed"),
+        help="Enable repeated execution: six command slew limits in joint units/second.",
+    )
+    parser.add_argument("--servo-hz", type=float, default=20.0)
+    parser.add_argument("--action-duration-s", type=float, default=1.0,
+                        help="Execute each predicted first target for this long, then infer again.")
     parser.add_argument(
         "--joint-lower",
         type=lambda value: parse_vector(value, "joint-lower"),
@@ -72,6 +102,14 @@ def main() -> None:
     lower, upper, max_delta = validate_limits(
         args.joint_lower, args.joint_upper, args.max_step_delta
     )
+    for name in ("servo_hz", "action_duration_s", "control_period_s"):
+        if not np.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            parser.error(f"{name} must be finite and positive")
+    if args.max_control_steps <= 0:
+        parser.error("max-control-steps must be positive")
+    if args.max_joint_speed is not None:
+        if not np.all(np.isfinite(args.max_joint_speed)) or np.any(args.max_joint_speed <= 0):
+            parser.error("max-joint-speed must contain six finite positive values")
     front_camera = cv2.VideoCapture(args.front_camera_index)
     side_camera = cv2.VideoCapture(args.side_camera_index)
     if not front_camera.isOpened() or not side_camera.isOpened():
@@ -83,7 +121,7 @@ def main() -> None:
     )
     print("Policy server metadata:", client.get_server_metadata())
     print(
-        "MOTION ENABLED: only one filtered action is sent per policy request."
+        "MOTION ENABLED: executing the first predicted target with configured limits."
         if args.enable_motion
         else "DRY RUN: no policy target will be sent. Driver connection still "
              "configures motors and may calibrate or enable torque."
@@ -113,16 +151,27 @@ def main() -> None:
 
             current = robot.read_state()
             raw_target = actions[0, 0]
+            if np.any(current < lower) or np.any(current > upper):
+                raise UnsafeActionError(f"Joint state outside configured bounds: {current}")
             safe_target = make_safe_target(
                 raw_target, current, lower, upper, max_delta
             )
+            if args.max_joint_speed is not None:
+                safe_target = np.clip(raw_target, lower, upper)
             print(
                 f"step={control_step} current={current} "
                 f"raw={raw_target} safe={safe_target}"
             )
             if args.enable_motion:
-                sent_target = robot.send_joint_target(safe_target)
-                print(f"step={control_step} sent={sent_target}")
+                if args.max_joint_speed is None:
+                    sent_target = robot.send_joint_target(safe_target)
+                    print(f"step={control_step} sent={sent_target}")
+                else:
+                    sent_target, measured = execute_target(
+                        robot, safe_target, lower, upper, max_delta,
+                        args.max_joint_speed, args.servo_hz, args.action_duration_s,
+                    )
+                    print(f"step={control_step} sent={sent_target} measured={measured}")
 
             elapsed = time.monotonic() - started_at
             time.sleep(max(0.0, args.control_period_s - elapsed))
