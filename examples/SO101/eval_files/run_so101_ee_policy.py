@@ -4,6 +4,8 @@
 import argparse
 import time
 import threading
+import json
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -152,12 +154,17 @@ def main():
     parser.add_argument("--camera-settle-s", type=positive, default=0.2,
                         help="Drain camera buffers this long after measured arrival.")
     parser.add_argument("--camera-timeout-s", type=positive, default=5)
+    parser.add_argument("--diagnostics-dir", type=Path,
+                        help="New directory for exact request images and per-step JSON.")
     args = parser.parse_args()
     if args.steps <= 0:
         parser.error("steps must be positive")
     if args.arrival_timeout_s <= args.settle_time_s:
         parser.error("arrival-timeout-s must exceed settle-time-s")
     kin = EEKinematics(args.urdf, args.conversion)
+    if args.diagnostics_dir is not None:
+        # Exclusive creation prevents overwriting a previous diagnostic run.
+        args.diagnostics_dir.mkdir(parents=True, exist_ok=False)
     robot = SO101RobotAdapter(args.robot_port, args.robot_id, use_degrees=True)
     front = side = client = None
     try:
@@ -166,6 +173,15 @@ def main():
         client = WebsocketClientPolicy(args.server_host, args.server_port)
         metadata = client.get_server_metadata()
         print("Server:", metadata)
+        if args.diagnostics_dir is not None:
+            (args.diagnostics_dir / "run.json").write_text(json.dumps({
+                "arguments": {key: str(value) if isinstance(value, Path) else value
+                              for key, value in vars(args).items()},
+                "server_metadata": metadata,
+                "conversion": kin.config,
+                "image_note": "Exact 224x224 RGB arrays submitted in examples, saved as lossless PNG. "
+                              "Camera timestamps are host read-completion times, not exposure times.",
+            }, indent=2) + "\n")
         keys = metadata.get("action_keys")
         expected = ["action." + name for name in ("x", "y", "z", "rx", "ry", "rz", "gripper")]
         if keys != expected:
@@ -183,6 +199,23 @@ def main():
             side_rgb, side_time = side.after(barrier, args.camera_timeout_s)
             observed_at = min(front_time, side_time)
             observed = robot.read_state()
+            record = {
+                "step": step, "observed_joints_deg_gripper": observed.tolist(),
+                "front_read_monotonic_s": front_time,
+                "side_read_monotonic_s": side_time,
+                "image_pair_skew_s": abs(front_time - side_time),
+                "task": args.task, "status": "request_pending",
+            }
+            record_path = None
+            if args.diagnostics_dir is not None:
+                record_path = args.diagnostics_dir / f"step_{step:03d}.json"
+                for name, rgb in (("front", front_rgb), ("side", side_rgb)):
+                    filename = f"step_{step:03d}_{name}.png"
+                    if not cv2.imwrite(str(args.diagnostics_dir / filename),
+                                       cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)):
+                        raise RuntimeError(f"Failed to write diagnostic image {filename}")
+                    record[name + "_image"] = filename
+                record_path.write_text(json.dumps(record, indent=2) + "\n")
             response = client.predict_action({
                 "examples": [{"image": [front_rgb, side_rgb], "lang": args.task}],
                 "unnorm_key": args.unnorm_key,
@@ -199,15 +232,40 @@ def main():
                     or not np.isfinite(actions).all()):
                 raise ValueError(f"Invalid EE actions: {actions.shape}")
             action = actions[0, 0]
+            observed_pose = kin.fk(kin.to_radians(observed[:5]))
             target_pose = kin.target(observed[:5], action)
+            print(f"TCP step={step} base_frame={kin.config['base_frame']} "
+                  f"current_m={observed_pose.translation} target_m={target_pose.translation} "
+                  f"delta_mm={action[:3] * 1000}")
+            record.update({
+                "status": "before_ik", "observation_age_s": age,
+                "predicted_actions": actions[0].tolist(),
+                "base_frame": kin.config["base_frame"],
+                "current_tcp_m": observed_pose.translation.tolist(),
+                "target_tcp_m": target_pose.translation.tolist(),
+                "current_rotation_matrix": observed_pose.rotation.tolist(),
+                "target_rotation_matrix": target_pose.rotation.tolist(),
+            })
+            if record_path is not None:
+                record_path.write_text(json.dumps(record, indent=2) + "\n")
             current = robot.read_state()
             if np.max(np.abs(current[:5] - observed[:5])) > args.max_tracking_error_deg:
                 raise RuntimeError("Arm changed pose while waiting for inference")
-            joints, pos_error, rot_error = kin.solve(
-                target_pose, current[:5], args.position_tolerance_m,
-                args.rotation_tolerance_deg, args.rotation_weight,
-            )
+            try:
+                joints, pos_error, rot_error = kin.solve(
+                    target_pose, current[:5], args.position_tolerance_m,
+                    args.rotation_tolerance_deg, args.rotation_weight,
+                )
+            except ValueError as error:
+                record.update(status="ik_rejected", error=str(error))
+                if record_path is not None:
+                    record_path.write_text(json.dumps(record, indent=2) + "\n")
+                raise
             target = np.r_[joints, kin.gripper(action[6])]
+            record.update(status="ik_passed", target_joints_deg_gripper=target.tolist(),
+                          ik_position_m=pos_error, ik_rotation_deg=rot_error)
+            if record_path is not None:
+                record_path.write_text(json.dumps(record, indent=2) + "\n")
             print(f"step={step} inference_s={age:.3f} action={action} "
                   f"target={target} ik_position_m={pos_error:.5f} "
                   f"ik_rotation_deg={rot_error:.3f}")
