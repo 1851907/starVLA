@@ -3,6 +3,7 @@
 
 import argparse
 import time
+import threading
 
 import cv2
 import numpy as np
@@ -19,11 +20,58 @@ def positive(value):
     return number
 
 
-def image(camera):
-    ok, frame = camera.read()
-    if not ok or frame is None:
-        raise RuntimeError("Camera frame acquisition failed")
-    return cv2.cvtColor(cv2.resize(frame, (224, 224)), cv2.COLOR_BGR2RGB)
+class FreshCamera:
+    """Drain camera buffers continuously; timestamp each read's start/end."""
+
+    def __init__(self, index):
+        self.camera = cv2.VideoCapture(index)
+        if not self.camera.isOpened():
+            self.camera.release()
+            raise RuntimeError(f"Cannot open camera {index}")
+        self.condition = threading.Condition()
+        self.stop = threading.Event()
+        self.latest = None
+        self.error = None
+        self.thread = threading.Thread(target=self._capture, daemon=True)
+        self.thread.start()
+
+    def _capture(self):
+        try:
+            while not self.stop.is_set():
+                started = time.monotonic()
+                ok, frame = self.camera.read()
+                if not ok or frame is None:
+                    raise RuntimeError("Camera frame acquisition failed")
+                with self.condition:
+                    self.latest = (started, time.monotonic(), frame)
+                    self.condition.notify_all()
+        except Exception as error:
+            with self.condition:
+                self.error = error
+                self.condition.notify_all()
+        finally:
+            self.camera.release()
+
+    def after(self, barrier, timeout):
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while self.latest is None or self.latest[0] <= barrier:
+                if self.error is not None:
+                    raise RuntimeError("Camera capture stopped") from self.error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Timed out waiting for a post-motion camera frame")
+                self.condition.wait(remaining)
+            if self.error is not None:
+                raise RuntimeError("Camera capture stopped") from self.error
+            _, timestamp, frame = self.latest
+            frame = frame.copy()
+        return cv2.cvtColor(cv2.resize(frame, (224, 224)), cv2.COLOR_BGR2RGB), timestamp
+
+    def close(self):
+        self.stop.set()
+        # The reader owns VideoCapture.release; avoid racing a blocked read.
+        self.thread.join(timeout=2)
 
 
 def move(robot, target, hz, arm_speed, gripper_speed):
@@ -39,6 +87,37 @@ def move(robot, target, hz, arm_speed, gripper_speed):
         robot.send_joint_target(start + alpha * (target - start))
         time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - began)))
     return robot.read_state()
+
+
+def wait_until_settled(robot, target, args):
+    """Require position tolerance AND low measured motion for a continuous window."""
+    began = time.monotonic()
+    stable_since = None
+    previous = robot.read_state().astype(float)
+    while True:
+        time.sleep(1.0 / args.settle_poll_hz)
+        measured = robot.read_state().astype(float)
+        now = time.monotonic()
+        if measured.shape != (6,) or not np.isfinite(measured).all():
+            raise RuntimeError("Invalid measured joint state")
+        arm_error = float(np.max(np.abs(measured[:5] - target[:5])))
+        grip_error = float(abs(measured[5] - target[5]))
+        stationary = (
+            np.max(np.abs(measured[:5] - previous[:5])) <= args.settle_motion_deg
+            and abs(measured[5] - previous[5]) <= args.settle_gripper_motion
+        )
+        if (arm_error <= args.arrival_tolerance_deg
+                and grip_error <= args.gripper_arrival_tolerance and stationary):
+            if stable_since is None:
+                stable_since = now
+            if now - stable_since >= args.settle_time_s:
+                return measured, now
+        else:
+            stable_since = None
+        if now - began >= args.arrival_timeout_s:
+            raise TimeoutError(f"Arrival timed out: arm_error={arm_error:.3f}deg "
+                               f"gripper_error={grip_error:.3f}; no new inference requested")
+        previous = measured
 
 
 def main():
@@ -63,17 +142,27 @@ def main():
     parser.add_argument("--rotation-weight", type=positive, default=0.05)
     parser.add_argument("--max-observation-age-s", type=positive, default=10)
     parser.add_argument("--max-tracking-error-deg", type=positive, default=10)
+    parser.add_argument("--arrival-tolerance-deg", type=positive, default=2)
+    parser.add_argument("--gripper-arrival-tolerance", type=positive, default=3)
+    parser.add_argument("--settle-time-s", type=positive, default=0.4)
+    parser.add_argument("--arrival-timeout-s", type=positive, default=10)
+    parser.add_argument("--settle-poll-hz", type=positive, default=20)
+    parser.add_argument("--settle-motion-deg", type=positive, default=0.3)
+    parser.add_argument("--settle-gripper-motion", type=positive, default=0.5)
+    parser.add_argument("--camera-settle-s", type=positive, default=0.2,
+                        help="Drain camera buffers this long after measured arrival.")
+    parser.add_argument("--camera-timeout-s", type=positive, default=5)
     args = parser.parse_args()
     if args.steps <= 0:
         parser.error("steps must be positive")
+    if args.arrival_timeout_s <= args.settle_time_s:
+        parser.error("arrival-timeout-s must exceed settle-time-s")
     kin = EEKinematics(args.urdf, args.conversion)
     robot = SO101RobotAdapter(args.robot_port, args.robot_id, use_degrees=True)
     front = side = client = None
     try:
-        front = cv2.VideoCapture(args.front_camera_index)
-        side = cv2.VideoCapture(args.side_camera_index)
-        if not front.isOpened() or not side.isOpened():
-            raise RuntimeError("Unable to open both cameras")
+        front = FreshCamera(args.front_camera_index)
+        side = FreshCamera(args.side_camera_index)
         client = WebsocketClientPolicy(args.server_host, args.server_port)
         metadata = client.get_server_metadata()
         print("Server:", metadata)
@@ -86,9 +175,13 @@ def main():
         print("MOTION ENABLED" if args.enable_motion else
               "DRY RUN: no policy targets sent; driver connection may enable torque/calibrate")
         robot.connect()
+        # First observation also waits for a stable measured pose.
+        _, arrived_at = wait_until_settled(robot, robot.read_state(), args)
         for step in range(args.steps):
-            front_rgb, side_rgb = image(front), image(side)
-            observed_at = time.monotonic()
+            barrier = arrived_at + args.camera_settle_s
+            front_rgb, front_time = front.after(barrier, args.camera_timeout_s)
+            side_rgb, side_time = side.after(barrier, args.camera_timeout_s)
+            observed_at = min(front_time, side_time)
             observed = robot.read_state()
             response = client.predict_action({
                 "examples": [{"image": [front_rgb, side_rgb], "lang": args.task}],
@@ -119,11 +212,11 @@ def main():
                   f"target={target} ik_position_m={pos_error:.5f} "
                   f"ik_rotation_deg={rot_error:.3f}")
             if args.enable_motion:
-                measured = move(robot, target, args.servo_hz,
-                                args.arm_speed_deg_s, args.gripper_speed)
-                print(f"measured={measured}")
-                if np.max(np.abs(measured[:5] - target[:5])) > args.max_tracking_error_deg:
-                    raise RuntimeError("Arm did not track the commanded target")
+                move(robot, target, args.servo_hz, args.arm_speed_deg_s, args.gripper_speed)
+                measured, arrived_at = wait_until_settled(robot, target, args)
+                print(f"ARRIVED step={step} measured={measured}; next capture follows arrival")
+            else:
+                _, arrived_at = wait_until_settled(robot, robot.read_state(), args)
     finally:
         # Disconnect before network cleanup; don't leave motors enabled if close fails.
         try:
@@ -138,9 +231,9 @@ def main():
                         bus.disconnect(True)
         finally:
             if front is not None:
-                front.release()
+                front.close()
             if side is not None:
-                side.release()
+                side.close()
             if client is not None:
                 client.close()
 
