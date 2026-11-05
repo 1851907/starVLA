@@ -186,6 +186,15 @@ def main():
         expected = ["action." + name for name in ("x", "y", "z", "rx", "ry", "rz", "gripper")]
         if keys != expected:
             raise ValueError(f"Expected converted EE model action_keys={expected}, got {keys}")
+        state_keys = metadata.get("state_keys")
+        expected_state = [
+            "state.x", "state.y", "state.z",
+            "state.rx", "state.ry", "state.rz", "state.gripper",
+        ]
+        if state_keys != expected_state:
+            raise ValueError(
+                f"Expected future6 EE model state_keys={expected_state}, got {state_keys}"
+            )
         if args.unnorm_key not in metadata.get("available_unnorm_keys", []):
             raise ValueError("Selected unnorm-key absent from server metadata")
         print("MOTION ENABLED" if args.enable_motion else
@@ -199,8 +208,10 @@ def main():
             side_rgb, side_time = side.after(barrier, args.camera_timeout_s)
             observed_at = min(front_time, side_time)
             observed = robot.read_state()
+            state = kin.state_from_joint_degrees(observed)
             record = {
                 "step": step, "observed_joints_deg_gripper": observed.tolist(),
+                "model_state": state.tolist(),
                 "front_read_monotonic_s": front_time,
                 "side_read_monotonic_s": side_time,
                 "image_pair_skew_s": abs(front_time - side_time),
@@ -217,7 +228,11 @@ def main():
                     record[name + "_image"] = filename
                 record_path.write_text(json.dumps(record, indent=2) + "\n")
             response = client.predict_action({
-                "examples": [{"image": [front_rgb, side_rgb], "lang": args.task}],
+                "examples": [{
+                    "image": [front_rgb, side_rgb],
+                    "lang": args.task,
+                    "state": state[None, :],
+                }],
                 "unnorm_key": args.unnorm_key,
                 "use_ddim": True, "num_ddim_steps": 20,
             })

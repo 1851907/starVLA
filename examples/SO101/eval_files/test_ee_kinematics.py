@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 import numpy as np
+import pinocchio as pin
 
 from ee_kinematics import EEKinematics, JOINTS
 
@@ -57,6 +58,24 @@ class IKTest(unittest.TestCase):
             )
             self.assertEqual(kin.gripper(0), 30)
             self.assertEqual(kin.gripper(1), 0)
+            state = kin.state_from_joint_degrees(np.r_[start, 30])
+            self.assertEqual(state.shape, (7,))
+            np.testing.assert_allclose(
+                state[:3],
+                kin.fk(kin.to_radians(start)).translation,
+                rtol=0,
+                atol=1e-6,
+            )
+            np.testing.assert_allclose(
+                state[3:6],
+                pin.log3(kin.fk(kin.to_radians(start)).rotation),
+                rtol=0,
+                atol=1e-6,
+            )
+            self.assertEqual(state[6], 0)
+            self.assertEqual(kin.state_from_joint_degrees(np.r_[start, 0])[6], 1)
+            with self.assertRaises(ValueError):
+                kin.state_from_joint_degrees(start)
             target.translation = np.array([10.0, 10.0, 10.0])
             with self.assertRaises(ValueError):
                 kin.solve(target, start)

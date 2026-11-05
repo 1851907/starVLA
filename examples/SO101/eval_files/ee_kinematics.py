@@ -61,6 +61,21 @@ class EEKinematics:
         return (self.data.oMf[self.frames[0]].inverse()
                 * self.data.oMf[self.frames[1]]).copy()
 
+    def state_from_joint_degrees(self, measured_degrees):
+        """Convert a measured SO101 state to the dataset's seven-dimensional EE state."""
+        measured_degrees = np.asarray(measured_degrees, dtype=float)
+        if (measured_degrees.shape != (6,)
+                or not np.isfinite(measured_degrees).all()):
+            raise ValueError("Expected six finite SO101 joint/gripper values")
+        pose = self.fk(self.to_radians(measured_degrees[:5]))
+        gripper_fraction = np.clip(
+            (measured_degrees[5] - self.closed) / (self.open - self.closed),
+            0.0,
+            1.0,
+        )
+        return np.r_[pose.translation, pin.log3(pose.rotation),
+                     gripper_fraction].astype(np.float32)
+
     def target(self, measured_degrees, action):
         action = np.asarray(action, dtype=float)
         if action.shape != (7,) or not np.isfinite(action).all():
