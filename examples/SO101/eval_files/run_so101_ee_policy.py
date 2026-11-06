@@ -26,6 +26,7 @@ class FreshCamera:
     """Drain camera buffers continuously; timestamp each read's start/end."""
 
     def __init__(self, index):
+        self.index = index
         self.camera = cv2.VideoCapture(index)
         if not self.camera.isOpened():
             self.camera.release()
@@ -38,12 +39,24 @@ class FreshCamera:
         self.thread.start()
 
     def _capture(self):
+        failed_since = None
         try:
             while not self.stop.is_set():
                 started = time.monotonic()
                 ok, frame = self.camera.read()
-                if not ok or frame is None:
-                    raise RuntimeError("Camera frame acquisition failed")
+                if not ok or frame is None or frame.size == 0:
+                    now = time.monotonic()
+                    if failed_since is None:
+                        failed_since = now
+                    if now - failed_since >= 2.0:
+                        raise RuntimeError(
+                            f"Camera {self.index}: frame reads failed continuously "
+                            f"for {now - failed_since:.2f}s"
+                        )
+                    # Do not publish a frame or timestamp on a failed read.
+                    self.stop.wait(0.05)
+                    continue
+                failed_since = None
                 with self.condition:
                     self.latest = (started, time.monotonic(), frame)
                     self.condition.notify_all()
@@ -59,13 +72,15 @@ class FreshCamera:
         with self.condition:
             while self.latest is None or self.latest[0] <= barrier:
                 if self.error is not None:
-                    raise RuntimeError("Camera capture stopped") from self.error
+                    raise RuntimeError(f"Camera {self.index} capture stopped: {self.error}") from self.error
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("Timed out waiting for a post-motion camera frame")
+                    raise TimeoutError(
+                        f"Camera {self.index}: timed out waiting for a post-motion frame"
+                    )
                 self.condition.wait(remaining)
             if self.error is not None:
-                raise RuntimeError("Camera capture stopped") from self.error
+                raise RuntimeError(f"Camera {self.index} capture stopped: {self.error}") from self.error
             _, timestamp, frame = self.latest
             frame = frame.copy()
         return cv2.cvtColor(cv2.resize(frame, (224, 224)), cv2.COLOR_BGR2RGB), timestamp
