@@ -159,6 +159,12 @@ def main():
     parser.add_argument("--rotation-weight", type=positive, default=0.05)
     parser.add_argument("--max-observation-age-s", type=positive, default=10)
     parser.add_argument("--max-tracking-error-deg", type=positive, default=10)
+    parser.add_argument(
+        "--replan-fraction",
+        type=float,
+        default=1.0,
+        help="Execute this fraction of the predicted EE translation/rotation before replanning.",
+    )
     parser.add_argument("--arrival-tolerance-deg", type=positive, default=2)
     parser.add_argument("--gripper-arrival-tolerance", type=positive, default=3)
     parser.add_argument("--settle-time-s", type=positive, default=0.4)
@@ -176,6 +182,8 @@ def main():
         parser.error("steps must be positive")
     if args.arrival_timeout_s <= args.settle_time_s:
         parser.error("arrival-timeout-s must exceed settle-time-s")
+    if not 0 < args.replan_fraction <= 1:
+        parser.error("replan-fraction must be in (0, 1]")
     kin = EEKinematics(args.urdf, args.conversion)
     if args.diagnostics_dir is not None:
         # Exclusive creation prevents overwriting a previous diagnostic run.
@@ -262,14 +270,22 @@ def main():
                     or not np.isfinite(actions).all()):
                 raise ValueError(f"Invalid EE actions: {actions.shape}")
             action = actions[0, 0]
+            executed_action = action.copy()
+            # EE position/rotation are deltas; gripper is an absolute target
+            # fraction and must not be scaled.
+            executed_action[:6] *= args.replan_fraction
             observed_pose = kin.fk(kin.to_radians(observed[:5]))
-            target_pose = kin.target(observed[:5], action)
+            target_pose = kin.target(observed[:5], executed_action)
             print(f"TCP step={step} base_frame={kin.config['base_frame']} "
                   f"current_m={observed_pose.translation} target_m={target_pose.translation} "
-                  f"delta_mm={action[:3] * 1000}")
+                  f"predicted_delta_mm={action[:3] * 1000} "
+                  f"executed_delta_mm={executed_action[:3] * 1000}")
             record.update({
                 "status": "before_ik", "observation_age_s": age,
                 "predicted_actions": actions[0].tolist(),
+                "predicted_action": action.tolist(),
+                "executed_action": executed_action.tolist(),
+                "replan_fraction": args.replan_fraction,
                 "base_frame": kin.config["base_frame"],
                 "current_tcp_m": observed_pose.translation.tolist(),
                 "target_tcp_m": target_pose.translation.tolist(),
@@ -291,12 +307,13 @@ def main():
                 if record_path is not None:
                     record_path.write_text(json.dumps(record, indent=2) + "\n")
                 raise
-            target = np.r_[joints, kin.gripper(action[6])]
+            target = np.r_[joints, kin.gripper(executed_action[6])]
             record.update(status="ik_passed", target_joints_deg_gripper=target.tolist(),
                           ik_position_m=pos_error, ik_rotation_deg=rot_error)
             if record_path is not None:
                 record_path.write_text(json.dumps(record, indent=2) + "\n")
-            print(f"step={step} inference_s={age:.3f} action={action} "
+            print(f"step={step} inference_s={age:.3f} "
+                  f"predicted_action={action} executed_action={executed_action} "
                   f"target={target} ik_position_m={pos_error:.5f} "
                   f"ik_rotation_deg={rot_error:.3f}")
             if args.enable_motion:
