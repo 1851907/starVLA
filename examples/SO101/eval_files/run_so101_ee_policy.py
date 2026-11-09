@@ -91,19 +91,36 @@ class FreshCamera:
         self.thread.join(timeout=2)
 
 
-def move(robot, target, hz, arm_speed, gripper_speed):
+def move(robot, target, hz, arm_speed, gripper_speed,
+         gripper_contact_motion=0.15, gripper_contact_time=0.35):
     start = robot.read_state().astype(float)
     duration = max(np.max(np.abs(target[:5] - start[:5])) / arm_speed,
                    abs(target[5] - start[5]) / gripper_speed, 1.0 / hz)
     # Smoothstep peaks at 1.5 times its average slope.
     ticks = max(1, int(np.ceil(1.5 * duration * hz)))
+    closing = target[5] < start[5] - gripper_contact_motion
+    gripper_stalled_since = None
+    previous = start
     for tick in range(1, ticks + 1):
         began = time.monotonic()
         alpha = tick / ticks
         alpha = alpha * alpha * (3 - 2 * alpha)
         robot.send_joint_target(start + alpha * (target - start))
+        measured = robot.read_state().astype(float)
+        if closing:
+            gripper_motion = abs(measured[5] - previous[5])
+            remaining = abs(target[5] - measured[5])
+            if (gripper_motion <= gripper_contact_motion
+                    and remaining > gripper_contact_motion):
+                if gripper_stalled_since is None:
+                    gripper_stalled_since = time.monotonic()
+                elif time.monotonic() - gripper_stalled_since >= gripper_contact_time:
+                    return measured, True
+            else:
+                gripper_stalled_since = None
+        previous = measured
         time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - began)))
-    return robot.read_state()
+    return robot.read_state().astype(float), False
 
 
 def wait_until_settled(robot, target, args):
@@ -167,6 +184,12 @@ def main():
     )
     parser.add_argument("--arrival-tolerance-deg", type=positive, default=2)
     parser.add_argument("--gripper-arrival-tolerance", type=positive, default=3)
+    parser.add_argument("--gripper-contact-motion", type=positive, default=0.15,
+                        help="Max gripper movement per control tick considered stalled.")
+    parser.add_argument("--gripper-contact-time-s", type=positive, default=0.35,
+                        help="Continuous stalled time before treating gripper as contacted.")
+    parser.add_argument("--gripper-min-fraction", type=float, default=0.08,
+                        help="Do not command a gripper fraction below this safety floor.")
     parser.add_argument("--settle-time-s", type=positive, default=0.4)
     parser.add_argument("--arrival-timeout-s", type=positive, default=10)
     parser.add_argument("--settle-poll-hz", type=positive, default=20)
@@ -184,6 +207,8 @@ def main():
         parser.error("arrival-timeout-s must exceed settle-time-s")
     if not 0 < args.replan_fraction <= 1:
         parser.error("replan-fraction must be in (0, 1]")
+    if not 0 <= args.gripper_min_fraction < 1:
+        parser.error("gripper-min-fraction must be in [0, 1)")
     kin = EEKinematics(args.urdf, args.conversion)
     if args.diagnostics_dir is not None:
         # Exclusive creation prevents overwriting a previous diagnostic run.
@@ -307,8 +332,13 @@ def main():
                 if record_path is not None:
                     record_path.write_text(json.dumps(record, indent=2) + "\n")
                 raise
-            target = np.r_[joints, kin.gripper(executed_action[6])]
+            requested_gripper_fraction = float(executed_action[6])
+            safe_gripper_fraction = max(requested_gripper_fraction,
+                                        args.gripper_min_fraction)
+            target = np.r_[joints, kin.gripper(safe_gripper_fraction)]
             record.update(status="ik_passed", target_joints_deg_gripper=target.tolist(),
+                          requested_gripper_fraction=requested_gripper_fraction,
+                          safe_gripper_fraction=safe_gripper_fraction,
                           ik_position_m=pos_error, ik_rotation_deg=rot_error)
             if record_path is not None:
                 record_path.write_text(json.dumps(record, indent=2) + "\n")
@@ -317,9 +347,23 @@ def main():
                   f"target={target} ik_position_m={pos_error:.5f} "
                   f"ik_rotation_deg={rot_error:.3f}")
             if args.enable_motion:
-                move(robot, target, args.servo_hz, args.arm_speed_deg_s, args.gripper_speed)
+                measured, gripper_contact = move(
+                    robot, target, args.servo_hz, args.arm_speed_deg_s,
+                    args.gripper_speed, args.gripper_contact_motion,
+                    args.gripper_contact_time_s,
+                )
+                if gripper_contact:
+                    # Hold the measured contact position; do not keep pushing
+                    # toward the blocked target.
+                    target = target.copy()
+                    target[5] = measured[5]
+                    record.update(status="gripper_contact",
+                                  contact_gripper=measured[5])
+                    if record_path is not None:
+                        record_path.write_text(json.dumps(record, indent=2) + "\n")
                 measured, arrived_at = wait_until_settled(robot, target, args)
-                print(f"ARRIVED step={step} measured={measured}; next capture follows arrival")
+                print(f"ARRIVED step={step} measured={measured} "
+                      f"gripper_contact={gripper_contact}; next capture follows arrival")
             else:
                 _, arrived_at = wait_until_settled(robot, robot.read_state(), args)
     finally:
