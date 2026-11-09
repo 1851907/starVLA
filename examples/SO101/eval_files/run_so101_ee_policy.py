@@ -190,6 +190,8 @@ def main():
                         help="Continuous stalled time before treating gripper as contacted.")
     parser.add_argument("--gripper-min-fraction", type=float, default=0.08,
                         help="Do not command a gripper fraction below this safety floor.")
+    parser.add_argument("--gripper-release-fraction", type=float, default=0.75,
+                        help="After contact, allow release only when the model requests at least this open fraction.")
     parser.add_argument("--settle-time-s", type=positive, default=0.4)
     parser.add_argument("--arrival-timeout-s", type=positive, default=10)
     parser.add_argument("--settle-poll-hz", type=positive, default=20)
@@ -209,6 +211,8 @@ def main():
         parser.error("replan-fraction must be in (0, 1]")
     if not 0 <= args.gripper_min_fraction < 1:
         parser.error("gripper-min-fraction must be in [0, 1)")
+    if not 0 < args.gripper_release_fraction <= 1:
+        parser.error("gripper-release-fraction must be in (0, 1]")
     kin = EEKinematics(args.urdf, args.conversion)
     if args.diagnostics_dir is not None:
         # Exclusive creation prevents overwriting a previous diagnostic run.
@@ -250,6 +254,8 @@ def main():
         robot.connect()
         # First observation also waits for a stable measured pose.
         _, arrived_at = wait_until_settled(robot, robot.read_state(), args)
+        gripper_phase = "open"
+        gripper_hold_value = None
         for step in range(args.steps):
             barrier = arrived_at + args.camera_settle_s
             front_rgb, front_time = front.after(barrier, args.camera_timeout_s)
@@ -332,13 +338,23 @@ def main():
                 if record_path is not None:
                     record_path.write_text(json.dumps(record, indent=2) + "\n")
                 raise
-            requested_gripper_fraction = float(executed_action[6])
+            model_gripper_fraction = float(executed_action[6])
+            if gripper_phase == "holding":
+                if model_gripper_fraction >= args.gripper_release_fraction:
+                    gripper_phase = "releasing"
+                    requested_gripper_fraction = model_gripper_fraction
+                else:
+                    requested_gripper_fraction = gripper_hold_value
+            else:
+                requested_gripper_fraction = model_gripper_fraction
             safe_gripper_fraction = max(requested_gripper_fraction,
                                         args.gripper_min_fraction)
             target = np.r_[joints, kin.gripper(safe_gripper_fraction)]
             record.update(status="ik_passed", target_joints_deg_gripper=target.tolist(),
+                          model_gripper_fraction=model_gripper_fraction,
                           requested_gripper_fraction=requested_gripper_fraction,
                           safe_gripper_fraction=safe_gripper_fraction,
+                          gripper_phase=gripper_phase,
                           ik_position_m=pos_error, ik_rotation_deg=rot_error)
             if record_path is not None:
                 record_path.write_text(json.dumps(record, indent=2) + "\n")
@@ -353,14 +369,21 @@ def main():
                     args.gripper_contact_time_s,
                 )
                 if gripper_contact:
-                    # Hold the measured contact position; do not keep pushing
-                    # toward the blocked target.
+                    # Latch the contact position. Future inference steps cannot
+                    # repeatedly command a closed gripper until a clear open
+                    # request is produced.
+                    gripper_phase = "holding"
+                    gripper_hold_value = float(measured[5])
                     target = target.copy()
-                    target[5] = measured[5]
+                    target[5] = gripper_hold_value
                     record.update(status="gripper_contact",
-                                  contact_gripper=measured[5])
+                                  contact_gripper=gripper_hold_value,
+                                  gripper_phase=gripper_phase)
                     if record_path is not None:
                         record_path.write_text(json.dumps(record, indent=2) + "\n")
+                elif gripper_phase == "releasing":
+                    gripper_phase = "open"
+                    gripper_hold_value = None
                 measured, arrived_at = wait_until_settled(robot, target, args)
                 print(f"ARRIVED step={step} measured={measured} "
                       f"gripper_contact={gripper_contact}; next capture follows arrival")
