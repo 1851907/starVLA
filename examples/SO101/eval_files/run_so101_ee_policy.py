@@ -154,6 +154,37 @@ def wait_until_settled(robot, target, args):
         previous = measured
 
 
+def verify_grasp_with_lift(robot, kin, measured, gripper_hold_value, args):
+    """Lift a contacted object briefly and require the arm to settle there."""
+    lift_action = np.array([0.0, 0.0, args.grasp_lift_m, 0.0, 0.0, 0.0, 0.0])
+    lift_pose = kin.target(measured[:5], lift_action)
+    joints, pos_error, rot_error = kin.solve(
+        lift_pose,
+        measured[:5],
+        args.position_tolerance_m,
+        args.rotation_tolerance_deg,
+        args.rotation_weight,
+    )
+    lift_target = np.r_[joints, gripper_hold_value]
+    move(
+        robot,
+        lift_target,
+        args.servo_hz,
+        args.arm_speed_deg_s,
+        args.gripper_speed,
+        # The gripper target is latched at the contact position.
+        args.gripper_contact_motion,
+        args.gripper_contact_time_s,
+    )
+    previous_timeout = args.arrival_timeout_s
+    args.arrival_timeout_s = args.grasp_lift_timeout_s
+    try:
+        settled, arrived_at = wait_until_settled(robot, lift_target, args)
+    finally:
+        args.arrival_timeout_s = previous_timeout
+    return settled, arrived_at, lift_target, pos_error, rot_error
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-host", required=True)
@@ -192,6 +223,10 @@ def main():
                         help="Do not command a gripper fraction below this safety floor.")
     parser.add_argument("--gripper-release-fraction", type=float, default=0.75,
                         help="After contact, allow release only when the model requests at least this open fraction.")
+    parser.add_argument("--grasp-lift-m", type=positive, default=0.03,
+                        help="Vertical lift used to verify a contacted object.")
+    parser.add_argument("--grasp-lift-timeout-s", type=positive, default=8,
+                        help="Timeout for the post-contact lift verification.")
     parser.add_argument("--settle-time-s", type=positive, default=0.4)
     parser.add_argument("--arrival-timeout-s", type=positive, default=10)
     parser.add_argument("--settle-poll-hz", type=positive, default=20)
@@ -339,7 +374,7 @@ def main():
                     record_path.write_text(json.dumps(record, indent=2) + "\n")
                 raise
             model_gripper_fraction = float(executed_action[6])
-            if gripper_phase == "holding":
+            if gripper_phase in ("holding", "grasp_failed", "grasp_confirmed"):
                 if model_gripper_fraction >= args.gripper_release_fraction:
                     gripper_phase = "releasing"
                     requested_gripper_fraction = model_gripper_fraction
@@ -381,6 +416,44 @@ def main():
                                   gripper_phase=gripper_phase)
                     if record_path is not None:
                         record_path.write_text(json.dumps(record, indent=2) + "\n")
+                    try:
+                        (
+                            measured,
+                            arrived_at,
+                            target,
+                            lift_pos_error,
+                            lift_rot_error,
+                        ) = (
+                            verify_grasp_with_lift(
+                                robot, kin, measured, gripper_hold_value, args
+                            )
+                        )
+                        gripper_phase = "grasp_confirmed"
+                        record.update(
+                            status="grasp_confirmed",
+                            gripper_phase=gripper_phase,
+                            grasp_lift_m=args.grasp_lift_m,
+                            grasp_lift_position_error_m=lift_pos_error,
+                            grasp_lift_rotation_error_deg=lift_rot_error,
+                            grasp_lift_measured=measured.tolist(),
+                        )
+                        print(
+                            f"GRASP CONFIRMED lift={args.grasp_lift_m:.3f}m "
+                            f"measured={measured}"
+                        )
+                    except (TimeoutError, ValueError, RuntimeError) as error:
+                        gripper_phase = "grasp_failed"
+                        measured = robot.read_state().astype(float)
+                        target = np.r_[measured[:5], gripper_hold_value]
+                        record.update(
+                            status="grasp_failed",
+                            gripper_phase=gripper_phase,
+                            grasp_lift_m=args.grasp_lift_m,
+                            grasp_error=str(error),
+                        )
+                        print(f"GRASP FAILED: {error}")
+                        # Do not continue transporting after an unverified
+                        # grasp. The next policy step may recover or retry.
                 elif gripper_phase == "releasing":
                     gripper_phase = "open"
                     gripper_hold_value = None
