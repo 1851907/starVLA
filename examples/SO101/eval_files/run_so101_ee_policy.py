@@ -185,6 +185,60 @@ def verify_grasp_with_lift(robot, kin, measured, gripper_hold_value, args):
     return settled, arrived_at, lift_target, pos_error, rot_error
 
 
+def execute_predicted_chunk(robot, kin, action, args, gripper_phase,
+                            gripper_hold_value):
+    """Execute one additional action from the already predicted horizon."""
+    measured = robot.read_state().astype(float)
+    executed_action = np.asarray(action, dtype=float).copy()
+    executed_action[:6] *= args.replan_fraction
+    target_pose = kin.target(measured[:5], executed_action)
+    joints, pos_error, rot_error = kin.solve(
+        target_pose,
+        measured[:5],
+        args.position_tolerance_m,
+        args.rotation_tolerance_deg,
+        args.rotation_weight,
+    )
+
+    model_gripper_fraction = float(executed_action[6])
+    if gripper_phase in ("holding", "grasp_failed", "grasp_confirmed"):
+        if model_gripper_fraction >= args.gripper_release_fraction:
+            gripper_phase = "releasing"
+            requested_gripper_fraction = model_gripper_fraction
+        else:
+            requested_gripper_fraction = gripper_hold_value
+    else:
+        requested_gripper_fraction = model_gripper_fraction
+    safe_gripper_fraction = max(
+        float(requested_gripper_fraction),
+        args.gripper_min_fraction,
+    )
+    target = np.r_[joints, kin.gripper(safe_gripper_fraction)]
+    measured, gripper_contact = move(
+        robot,
+        target,
+        args.servo_hz,
+        args.arm_speed_deg_s,
+        args.gripper_speed,
+        args.gripper_contact_motion,
+        args.gripper_contact_time_s,
+    )
+    if gripper_contact and gripper_phase not in ("releasing", "open"):
+        gripper_phase = "holding"
+        gripper_hold_value = float(measured[5])
+        target[5] = gripper_hold_value
+    measured, arrived_at = wait_until_settled(robot, target, args)
+    return (
+        measured,
+        arrived_at,
+        gripper_phase,
+        gripper_hold_value,
+        gripper_contact,
+        pos_error,
+        rot_error,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-host", required=True)
@@ -198,6 +252,12 @@ def main():
     parser.add_argument("--front-camera-index", type=int, default=0)
     parser.add_argument("--side-camera-index", type=int, default=1)
     parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument(
+        "--execute-chunk",
+        type=int,
+        default=1,
+        help="Execute chunk0 through this predicted chunk (1-8).",
+    )
     parser.add_argument("--enable-motion", action="store_true")
     parser.add_argument("--servo-hz", type=positive, default=30)
     parser.add_argument("--arm-speed-deg-s", type=positive, default=15)
@@ -240,6 +300,8 @@ def main():
     args = parser.parse_args()
     if args.steps <= 0:
         parser.error("steps must be positive")
+    if not 1 <= args.execute_chunk <= 8:
+        parser.error("execute-chunk must be between 1 and 8")
     if args.arrival_timeout_s <= args.settle_time_s:
         parser.error("arrival-timeout-s must exceed settle-time-s")
     if not 0 < args.replan_fraction <= 1:
@@ -460,6 +522,47 @@ def main():
                 measured, arrived_at = wait_until_settled(robot, target, args)
                 print(f"ARRIVED step={step} measured={measured} "
                       f"gripper_contact={gripper_contact}; next capture follows arrival")
+                if (
+                    args.execute_chunk > 1
+                    and not gripper_contact
+                ):
+                    for chunk_index in range(
+                        1, min(args.execute_chunk, actions.shape[1])
+                    ):
+                        try:
+                            (
+                                measured,
+                                arrived_at,
+                                gripper_phase,
+                                gripper_hold_value,
+                                chunk_contact,
+                                chunk_pos_error,
+                                chunk_rot_error,
+                            ) = execute_predicted_chunk(
+                                robot,
+                                kin,
+                                actions[0, chunk_index],
+                                args,
+                                gripper_phase,
+                                gripper_hold_value,
+                            )
+                        except (TimeoutError, ValueError, RuntimeError) as error:
+                            print(
+                                f"CHUNK STOPPED chunk={chunk_index} error={error}"
+                            )
+                            break
+                        print(
+                            f"CHUNK ARRIVED chunk={chunk_index} "
+                            f"gripper_phase={gripper_phase} "
+                            f"gripper_contact={chunk_contact} "
+                            f"ik_position_m={chunk_pos_error:.5f} "
+                            f"ik_rotation_deg={chunk_rot_error:.3f}"
+                        )
+                        if gripper_phase == "releasing":
+                            gripper_phase = "open"
+                            gripper_hold_value = None
+                        if chunk_contact:
+                            break
             else:
                 _, arrived_at = wait_until_settled(robot, robot.read_state(), args)
     finally:
