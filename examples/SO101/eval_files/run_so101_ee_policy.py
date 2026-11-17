@@ -123,6 +123,27 @@ def move(robot, target, hz, arm_speed, gripper_speed,
     return robot.read_state().astype(float), False
 
 
+def move_arm_only(robot, target_joints, hz, arm_speed):
+    """Move the five arm joints while holding the current gripper position."""
+    start = robot.read_state().astype(float)
+    target = start.copy()
+    target[:5] = np.asarray(target_joints, dtype=float)
+    duration = max(np.max(np.abs(target[:5] - start[:5])) / arm_speed, 1.0 / hz)
+    ticks = max(1, int(np.ceil(1.5 * duration * hz)))
+
+    for tick in range(1, ticks + 1):
+        began = time.monotonic()
+        alpha = tick / ticks
+        alpha = alpha * alpha * (3 - 2 * alpha)
+        command = start.copy()
+        command[:5] = start[:5] + alpha * (target[:5] - start[:5])
+        command[5] = start[5]
+        robot.send_joint_target(command)
+        time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - began)))
+
+    return robot.read_state().astype(float)
+
+
 def wait_until_settled(robot, target, args):
     """Require position tolerance AND low measured motion for a continuous window."""
     began = time.monotonic()
@@ -213,20 +234,29 @@ def execute_predicted_chunk(robot, kin, action, args, gripper_phase,
         float(requested_gripper_fraction),
         args.gripper_min_fraction,
     )
-    target = np.r_[joints, kin.gripper(safe_gripper_fraction)]
-    measured, gripper_contact = move(
-        robot,
-        target,
-        args.servo_hz,
-        args.arm_speed_deg_s,
-        args.gripper_speed,
-        args.gripper_contact_motion,
-        args.gripper_contact_time_s,
-    )
-    if gripper_contact and gripper_phase not in ("releasing", "open"):
-        gripper_phase = "holding"
-        gripper_hold_value = float(measured[5])
-        target[5] = gripper_hold_value
+    if gripper_phase in ("holding", "grasp_failed", "grasp_confirmed"):
+        # Never send a stale predicted gripper target while executing a
+        # post-contact chunk. Keep the measured contact position latched.
+        target = np.r_[joints, gripper_hold_value]
+        measured = move_arm_only(
+            robot, joints, args.servo_hz, args.arm_speed_deg_s
+        )
+        gripper_contact = False
+    else:
+        target = np.r_[joints, kin.gripper(safe_gripper_fraction)]
+        measured, gripper_contact = move(
+            robot,
+            target,
+            args.servo_hz,
+            args.arm_speed_deg_s,
+            args.gripper_speed,
+            args.gripper_contact_motion,
+            args.gripper_contact_time_s,
+        )
+        if gripper_contact and gripper_phase not in ("releasing", "open"):
+            gripper_phase = "holding"
+            gripper_hold_value = float(measured[5])
+            target[5] = gripper_hold_value
     measured, arrived_at = wait_until_settled(robot, target, args)
     return (
         measured,
