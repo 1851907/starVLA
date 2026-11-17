@@ -91,56 +91,18 @@ class FreshCamera:
         self.thread.join(timeout=2)
 
 
-def move(robot, target, hz, arm_speed, gripper_speed,
-         gripper_contact_motion=0.15, gripper_contact_time=0.35):
+def move(robot, target, hz, arm_speed, gripper_speed):
     start = robot.read_state().astype(float)
     duration = max(np.max(np.abs(target[:5] - start[:5])) / arm_speed,
                    abs(target[5] - start[5]) / gripper_speed, 1.0 / hz)
     # Smoothstep peaks at 1.5 times its average slope.
     ticks = max(1, int(np.ceil(1.5 * duration * hz)))
-    closing = target[5] < start[5] - gripper_contact_motion
-    gripper_stalled_since = None
-    previous = start
     for tick in range(1, ticks + 1):
         began = time.monotonic()
         alpha = tick / ticks
         alpha = alpha * alpha * (3 - 2 * alpha)
         robot.send_joint_target(start + alpha * (target - start))
-        measured = robot.read_state().astype(float)
-        if closing:
-            gripper_motion = abs(measured[5] - previous[5])
-            remaining = abs(target[5] - measured[5])
-            if (gripper_motion <= gripper_contact_motion
-                    and remaining > gripper_contact_motion):
-                if gripper_stalled_since is None:
-                    gripper_stalled_since = time.monotonic()
-                elif time.monotonic() - gripper_stalled_since >= gripper_contact_time:
-                    return measured, True
-            else:
-                gripper_stalled_since = None
-        previous = measured
         time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - began)))
-    return robot.read_state().astype(float), False
-
-
-def move_arm_only(robot, target_joints, hz, arm_speed):
-    """Move the five arm joints while holding the current gripper position."""
-    start = robot.read_state().astype(float)
-    target = start.copy()
-    target[:5] = np.asarray(target_joints, dtype=float)
-    duration = max(np.max(np.abs(target[:5] - start[:5])) / arm_speed, 1.0 / hz)
-    ticks = max(1, int(np.ceil(1.5 * duration * hz)))
-
-    for tick in range(1, ticks + 1):
-        began = time.monotonic()
-        alpha = tick / ticks
-        alpha = alpha * alpha * (3 - 2 * alpha)
-        command = start.copy()
-        command[:5] = start[:5] + alpha * (target[:5] - start[:5])
-        command[5] = start[5]
-        robot.send_joint_target(command)
-        time.sleep(max(0.0, 1.0 / hz - (time.monotonic() - began)))
-
     return robot.read_state().astype(float)
 
 
@@ -175,39 +137,7 @@ def wait_until_settled(robot, target, args):
         previous = measured
 
 
-def verify_grasp_with_lift(robot, kin, measured, gripper_hold_value, args):
-    """Lift a contacted object briefly and require the arm to settle there."""
-    lift_action = np.array([0.0, 0.0, args.grasp_lift_m, 0.0, 0.0, 0.0, 0.0])
-    lift_pose = kin.target(measured[:5], lift_action)
-    joints, pos_error, rot_error = kin.solve(
-        lift_pose,
-        measured[:5],
-        args.position_tolerance_m,
-        args.rotation_tolerance_deg,
-        args.rotation_weight,
-    )
-    lift_target = np.r_[joints, gripper_hold_value]
-    move(
-        robot,
-        lift_target,
-        args.servo_hz,
-        args.arm_speed_deg_s,
-        args.gripper_speed,
-        # The gripper target is latched at the contact position.
-        args.gripper_contact_motion,
-        args.gripper_contact_time_s,
-    )
-    previous_timeout = args.arrival_timeout_s
-    args.arrival_timeout_s = args.grasp_lift_timeout_s
-    try:
-        settled, arrived_at = wait_until_settled(robot, lift_target, args)
-    finally:
-        args.arrival_timeout_s = previous_timeout
-    return settled, arrived_at, lift_target, pos_error, rot_error
-
-
-def execute_predicted_chunk(robot, kin, action, args, gripper_phase,
-                            gripper_hold_value):
+def execute_predicted_chunk(robot, kin, action, args):
     """Execute one additional action from the already predicted horizon."""
     measured = robot.read_state().astype(float)
     executed_action = np.asarray(action, dtype=float).copy()
@@ -221,52 +151,12 @@ def execute_predicted_chunk(robot, kin, action, args, gripper_phase,
         args.rotation_weight,
     )
 
-    model_gripper_fraction = float(executed_action[6])
-    if gripper_phase in ("holding", "grasp_failed", "grasp_confirmed"):
-        if model_gripper_fraction >= args.gripper_release_fraction:
-            gripper_phase = "releasing"
-            requested_gripper_fraction = model_gripper_fraction
-        else:
-            requested_gripper_fraction = gripper_hold_value
-    else:
-        requested_gripper_fraction = model_gripper_fraction
-    safe_gripper_fraction = max(
-        float(requested_gripper_fraction),
-        args.gripper_min_fraction,
+    target = np.r_[joints, kin.gripper(float(executed_action[6]))]
+    measured = move(
+        robot, target, args.servo_hz, args.arm_speed_deg_s, args.gripper_speed
     )
-    if gripper_phase in ("holding", "grasp_failed", "grasp_confirmed"):
-        # Never send a stale predicted gripper target while executing a
-        # post-contact chunk. Keep the measured contact position latched.
-        target = np.r_[joints, gripper_hold_value]
-        measured = move_arm_only(
-            robot, joints, args.servo_hz, args.arm_speed_deg_s
-        )
-        gripper_contact = False
-    else:
-        target = np.r_[joints, kin.gripper(safe_gripper_fraction)]
-        measured, gripper_contact = move(
-            robot,
-            target,
-            args.servo_hz,
-            args.arm_speed_deg_s,
-            args.gripper_speed,
-            args.gripper_contact_motion,
-            args.gripper_contact_time_s,
-        )
-        if gripper_contact and gripper_phase not in ("releasing", "open"):
-            gripper_phase = "holding"
-            gripper_hold_value = float(measured[5])
-            target[5] = gripper_hold_value
     measured, arrived_at = wait_until_settled(robot, target, args)
-    return (
-        measured,
-        arrived_at,
-        gripper_phase,
-        gripper_hold_value,
-        gripper_contact,
-        pos_error,
-        rot_error,
-    )
+    return measured, arrived_at, pos_error, rot_error
 
 
 def main():
@@ -305,18 +195,6 @@ def main():
     )
     parser.add_argument("--arrival-tolerance-deg", type=positive, default=2)
     parser.add_argument("--gripper-arrival-tolerance", type=positive, default=3)
-    parser.add_argument("--gripper-contact-motion", type=positive, default=0.15,
-                        help="Max gripper movement per control tick considered stalled.")
-    parser.add_argument("--gripper-contact-time-s", type=positive, default=0.35,
-                        help="Continuous stalled time before treating gripper as contacted.")
-    parser.add_argument("--gripper-min-fraction", type=float, default=0.08,
-                        help="Do not command a gripper fraction below this safety floor.")
-    parser.add_argument("--gripper-release-fraction", type=float, default=0.75,
-                        help="After contact, allow release only when the model requests at least this open fraction.")
-    parser.add_argument("--grasp-lift-m", type=positive, default=0.03,
-                        help="Vertical lift used to verify a contacted object.")
-    parser.add_argument("--grasp-lift-timeout-s", type=positive, default=8,
-                        help="Timeout for the post-contact lift verification.")
     parser.add_argument("--settle-time-s", type=positive, default=0.4)
     parser.add_argument("--arrival-timeout-s", type=positive, default=10)
     parser.add_argument("--settle-poll-hz", type=positive, default=20)
@@ -336,10 +214,6 @@ def main():
         parser.error("arrival-timeout-s must exceed settle-time-s")
     if not 0 < args.replan_fraction <= 1:
         parser.error("replan-fraction must be in (0, 1]")
-    if not 0 <= args.gripper_min_fraction < 1:
-        parser.error("gripper-min-fraction must be in [0, 1)")
-    if not 0 < args.gripper_release_fraction <= 1:
-        parser.error("gripper-release-fraction must be in (0, 1]")
     kin = EEKinematics(args.urdf, args.conversion)
     if args.diagnostics_dir is not None:
         # Exclusive creation prevents overwriting a previous diagnostic run.
@@ -381,8 +255,6 @@ def main():
         robot.connect()
         # First observation also waits for a stable measured pose.
         _, arrived_at = wait_until_settled(robot, robot.read_state(), args)
-        gripper_phase = "open"
-        gripper_hold_value = None
         for step in range(args.steps):
             barrier = arrived_at + args.camera_settle_s
             front_rgb, front_time = front.after(barrier, args.camera_timeout_s)
@@ -449,6 +321,7 @@ def main():
                 "target_tcp_m": target_pose.translation.tolist(),
                 "current_rotation_matrix": observed_pose.rotation.tolist(),
                 "target_rotation_matrix": target_pose.rotation.tolist(),
+                "predicted_gripper_plan": actions[0, :, 6].tolist(),
             })
             if record_path is not None:
                 record_path.write_text(json.dumps(record, indent=2) + "\n")
@@ -465,23 +338,9 @@ def main():
                 if record_path is not None:
                     record_path.write_text(json.dumps(record, indent=2) + "\n")
                 raise
-            model_gripper_fraction = float(executed_action[6])
-            if gripper_phase in ("holding", "grasp_failed", "grasp_confirmed"):
-                if model_gripper_fraction >= args.gripper_release_fraction:
-                    gripper_phase = "releasing"
-                    requested_gripper_fraction = model_gripper_fraction
-                else:
-                    requested_gripper_fraction = gripper_hold_value
-            else:
-                requested_gripper_fraction = model_gripper_fraction
-            safe_gripper_fraction = max(requested_gripper_fraction,
-                                        args.gripper_min_fraction)
-            target = np.r_[joints, kin.gripper(safe_gripper_fraction)]
+            target = np.r_[joints, kin.gripper(float(executed_action[6]))]
             record.update(status="ik_passed", target_joints_deg_gripper=target.tolist(),
-                          model_gripper_fraction=model_gripper_fraction,
-                          requested_gripper_fraction=requested_gripper_fraction,
-                          safe_gripper_fraction=safe_gripper_fraction,
-                          gripper_phase=gripper_phase,
+                          model_gripper_fraction=float(executed_action[6]),
                           ik_position_m=pos_error, ik_rotation_deg=rot_error)
             if record_path is not None:
                 record_path.write_text(json.dumps(record, indent=2) + "\n")
@@ -490,71 +349,15 @@ def main():
                   f"target={target} ik_position_m={pos_error:.5f} "
                   f"ik_rotation_deg={rot_error:.3f}")
             if args.enable_motion:
-                measured, gripper_contact = move(
+                measured = move(
                     robot, target, args.servo_hz, args.arm_speed_deg_s,
-                    args.gripper_speed, args.gripper_contact_motion,
-                    args.gripper_contact_time_s,
+                    args.gripper_speed,
                 )
-                if gripper_contact:
-                    # Latch the contact position. Future inference steps cannot
-                    # repeatedly command a closed gripper until a clear open
-                    # request is produced.
-                    gripper_phase = "holding"
-                    gripper_hold_value = float(measured[5])
-                    target = target.copy()
-                    target[5] = gripper_hold_value
-                    record.update(status="gripper_contact",
-                                  contact_gripper=gripper_hold_value,
-                                  gripper_phase=gripper_phase)
-                    if record_path is not None:
-                        record_path.write_text(json.dumps(record, indent=2) + "\n")
-                    try:
-                        (
-                            measured,
-                            arrived_at,
-                            target,
-                            lift_pos_error,
-                            lift_rot_error,
-                        ) = (
-                            verify_grasp_with_lift(
-                                robot, kin, measured, gripper_hold_value, args
-                            )
-                        )
-                        gripper_phase = "grasp_confirmed"
-                        record.update(
-                            status="grasp_confirmed",
-                            gripper_phase=gripper_phase,
-                            grasp_lift_m=args.grasp_lift_m,
-                            grasp_lift_position_error_m=lift_pos_error,
-                            grasp_lift_rotation_error_deg=lift_rot_error,
-                            grasp_lift_measured=measured.tolist(),
-                        )
-                        print(
-                            f"GRASP CONFIRMED lift={args.grasp_lift_m:.3f}m "
-                            f"measured={measured}"
-                        )
-                    except (TimeoutError, ValueError, RuntimeError) as error:
-                        gripper_phase = "grasp_failed"
-                        measured = robot.read_state().astype(float)
-                        target = np.r_[measured[:5], gripper_hold_value]
-                        record.update(
-                            status="grasp_failed",
-                            gripper_phase=gripper_phase,
-                            grasp_lift_m=args.grasp_lift_m,
-                            grasp_error=str(error),
-                        )
-                        print(f"GRASP FAILED: {error}")
-                        # Do not continue transporting after an unverified
-                        # grasp. The next policy step may recover or retry.
-                elif gripper_phase == "releasing":
-                    gripper_phase = "open"
-                    gripper_hold_value = None
                 measured, arrived_at = wait_until_settled(robot, target, args)
                 print(f"ARRIVED step={step} measured={measured} "
-                      f"gripper_contact={gripper_contact}; next capture follows arrival")
+                      f"model_gripper={executed_action[6]:.3f}; next capture follows arrival")
                 if (
                     args.execute_chunk > 1
-                    and not gripper_contact
                 ):
                     for chunk_index in range(
                         1, min(args.execute_chunk, actions.shape[1])
@@ -563,9 +366,6 @@ def main():
                             (
                                 measured,
                                 arrived_at,
-                                gripper_phase,
-                                gripper_hold_value,
-                                chunk_contact,
                                 chunk_pos_error,
                                 chunk_rot_error,
                             ) = execute_predicted_chunk(
@@ -573,8 +373,6 @@ def main():
                                 kin,
                                 actions[0, chunk_index],
                                 args,
-                                gripper_phase,
-                                gripper_hold_value,
                             )
                         except (TimeoutError, ValueError, RuntimeError) as error:
                             print(
@@ -583,16 +381,9 @@ def main():
                             break
                         print(
                             f"CHUNK ARRIVED chunk={chunk_index} "
-                            f"gripper_phase={gripper_phase} "
-                            f"gripper_contact={chunk_contact} "
                             f"ik_position_m={chunk_pos_error:.5f} "
                             f"ik_rotation_deg={chunk_rot_error:.3f}"
                         )
-                        if gripper_phase == "releasing":
-                            gripper_phase = "open"
-                            gripper_hold_value = None
-                        if chunk_contact:
-                            break
             else:
                 _, arrived_at = wait_until_settled(robot, robot.read_state(), args)
     finally:
